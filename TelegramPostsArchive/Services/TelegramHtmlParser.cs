@@ -1,10 +1,10 @@
-﻿using HtmlAgilityPack;
-using System.Globalization;
+﻿using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using HtmlAgilityPack;
+using TelegramPostsArchive.Models.Parser;
 
 namespace TelegramPostsArchive.Services;
 
@@ -40,6 +40,7 @@ public class TelegramHtmlParser
             : null;
 
         var messages = new List<ParsedMessage>();
+        var diagnostics = new List<string>();
 
         // Find every Telegram message.
         var messageNodes = document.DocumentNode.SelectNodes(
@@ -56,8 +57,12 @@ public class TelegramHtmlParser
 
                 var parsedPost = ParsePostRef(post);
 
-                if (parsedPost == null)
+                if (parsedPost == null || parsedPost.Value.MessageId <= 0 ||
+                    !string.Equals(parsedPost.Value.Username, channelUsername, StringComparison.OrdinalIgnoreCase))
+                {
+                    diagnostics.Add($"Invalid post reference: {post}");
                     continue;
+                }
 
                 var (username, messageId) = parsedPost.Value;
 
@@ -67,7 +72,7 @@ public class TelegramHtmlParser
                     "' tgme_widget_message_text ')]");
 
                 string text = textNode != null
-                    ? NormalizeText(textNode.InnerText)
+                    ? ExtractText(textNode)
                     : "";
 
                 // Extract publication datetime.
@@ -77,6 +82,12 @@ public class TelegramHtmlParser
 
                 DateTimeOffset? postedAt = ParseDateTime(
                     timeNode?.GetAttributeValue("datetime", null));
+
+                if (postedAt == null)
+                {
+                    diagnostics.Add($"Missing or invalid publication time: {post}");
+                    continue;
+                }
 
                 // Extract views.
                 var viewNode = node.SelectSingleNode(
@@ -104,6 +115,33 @@ public class TelegramHtmlParser
                             links.Add(normalizedLink);
                     }
                 }
+
+                var mediaUrls = new List<string>();
+                foreach (var element in node.Descendants())
+                {
+                    string? mediaUrl = null;
+                    var classes = element.GetAttributeValue("class", "").Split(' ');
+                    if (classes.Contains("tgme_widget_message_photo_wrap"))
+                    {
+                        var style = element.GetAttributeValue("style", "");
+                        var match = Regex.Match(style, @"background-image\s*:\s*url\(\s*['""]?(?<url>[^'"")]+)", RegexOptions.IgnoreCase);
+                        if (match.Success)
+                            mediaUrl = match.Groups["url"].Value.Trim();
+                    }
+                    else if (element.Name == "video" || (element.Name == "source" && element.ParentNode?.Name == "video"))
+                    {
+                        mediaUrl = element.GetAttributeValue("src", "");
+                    }
+
+                    var normalized = NormalizeLink(mediaUrl);
+                    if (normalized != null)
+                        mediaUrls.Add(normalized);
+                }
+
+                var metadata = node.SelectSingleNode(
+                    ".//*[contains(concat(' ', normalize-space(@class), ' '), ' tgme_widget_message_meta ')]");
+                bool? edited = metadata != null && Regex.IsMatch(
+                    metadata.InnerText, @"\bedited\b", RegexOptions.IgnoreCase) ? true : null;
 
                 // Extract forwarding information.
                 var forwardNode = node.SelectSingleNode(
@@ -140,6 +178,8 @@ public class TelegramHtmlParser
                         .ToList(),
                     Mentions = mentions,
                     ForwardFrom = forwardFrom,
+                    MediaUrls = mediaUrls.Distinct(StringComparer.Ordinal).ToList(),
+                    IsEdited = edited,
                     ContentHash = ContentHash(
                         username, messageId, text)
                 });
@@ -151,13 +191,75 @@ public class TelegramHtmlParser
             ? messages.Min(m => m.TgMsgId)
             : null;
 
+        int? olderBefore = null;
+        var olderLinks = document.DocumentNode.SelectNodes(
+            "//a[contains(concat(' ', normalize-space(@class), ' '), ' tme_messages_more ') and not(@data-after)]");
+        if (olderLinks != null)
+        {
+            if (olderLinks.Count != 1)
+                diagnostics.Add("Ambiguous older-page links.");
+            else
+            {
+                var href = HtmlEntity.DeEntitize(olderLinks[0].GetAttributeValue("href", ""));
+                if (Uri.TryCreate(new Uri("https://t.me/"), href, out var olderUri) &&
+                    olderUri.Host == "t.me" &&
+                    string.Equals(olderUri.AbsolutePath, $"/s/{channelUsername}", StringComparison.OrdinalIgnoreCase) &&
+                    Regex.IsMatch(olderUri.Query, @"^\?before=[0-9]+$") &&
+                    int.TryParse(olderUri.Query["?before=".Length..], out var cursor) &&
+                    cursor > 0 && cursor == nextBefore)
+                    olderBefore = cursor;
+                else
+                    diagnostics.Add("Invalid older-page cursor.");
+            }
+        }
+
+        var historyNode = document.DocumentNode.SelectSingleNode(
+            "//*[contains(concat(' ', normalize-space(@class), ' '), ' tgme_channel_history ')]");
+
         return new ParsedPage
         {
             ChannelUsername = channelUsername,
             ChannelTitle = channelTitle,
             Messages = messages,
-            NextBefore = nextBefore
+            Diagnostics = diagnostics,
+            NextBefore = nextBefore,
+            OlderBefore = olderBefore,
+            HasValidHistory = historyNode != null && !string.IsNullOrWhiteSpace(channelTitle)
         };
+    }
+
+    private static string ExtractText(HtmlNode node)
+    {
+        var text = new StringBuilder();
+        AppendText(node, text);
+        var decoded = HtmlEntity.DeEntitize(text.ToString()).Replace("\r", "");
+        return string.Join("\n", decoded.Split('\n')
+            .Select(line => Regex.Replace(line, @"[^\S\n]+", " ").Trim())).Trim();
+    }
+
+    private static void AppendText(HtmlNode node, StringBuilder text)
+    {
+        if (node.NodeType == HtmlNodeType.Text)
+        {
+            text.Append(node.InnerText);
+            return;
+        }
+
+        if (node.Name == "br")
+        {
+            text.Append('\n');
+            return;
+        }
+
+        var isBlock = node.Name is "p" or "blockquote";
+        if (isBlock && text.Length > 0 && text[^1] != '\n')
+            text.Append('\n');
+
+        foreach (var child in node.ChildNodes)
+            AppendText(child, text);
+
+        if (isBlock && text.Length > 0 && text[^1] != '\n')
+            text.Append('\n');
     }
 
     // -----------------------------------------
@@ -306,6 +408,8 @@ public class TelegramHtmlParser
             return null;
 
         string link = HtmlEntity.DeEntitize(value).Trim();
+        if (link.StartsWith("//", StringComparison.Ordinal))
+            link = "https:" + link;
 
         if (!Uri.TryCreate(
                 link,
@@ -354,68 +458,5 @@ public class TelegramHtmlParser
         byte[] hash = SHA256.HashData(bytes);
 
         return Convert.ToHexString(hash).ToLowerInvariant();
-    }
-}
-
-
-public sealed class ParsedMessage
-{
-    public string ChannelUsername { get; set; } = "";
-    public string? ChannelTitle { get; set; }
-    public int TgMsgId { get; set; }
-    public string Url { get; set; } = "";
-    public DateTimeOffset? PostedAt { get; set; }
-    public string Text { get; set; } = "";
-    public int? Views { get; set; }
-    public List<string> Links { get; set; } = new();
-    public List<string> Mentions { get; set; } = new();
-    public string? ForwardFrom { get; set; }
-    public string ContentHash { get; set; } = "";
-}
-
-public sealed class ParsedPage
-{
-    public string ChannelUsername { get; set; } = "";
-    public string? ChannelTitle { get; set; }
-    public List<ParsedMessage> Messages { get; set; } = new();
-    public int? NextBefore { get; set; }
-}
-
-// ---------------------------------------------
-// Parser configuration
-// ---------------------------------------------
-
-public sealed class ParserOptions
-{
-    public Dictionary<string, double> ViewMultipliers { get; set; } =
-        new(StringComparer.OrdinalIgnoreCase)
-        {
-            ["k"] = 1_000,
-            ["m"] = 1_000_000,
-            ["b"] = 1_000_000_000
-        };
-
-    public static ParserOptions LoadRules(string path)
-    {
-        if (!File.Exists(path))
-            return new ParserOptions();
-
-        using var document = JsonDocument.Parse(File.ReadAllText(path));
-
-        var options = new ParserOptions();
-
-        if (document.RootElement.TryGetProperty(
-                "view_multipliers", out var multipliers))
-        {
-            options.ViewMultipliers.Clear();
-
-            foreach (var property in multipliers.EnumerateObject())
-            {
-                options.ViewMultipliers[property.Name] =
-                    property.Value.GetDouble();
-            }
-        }
-
-        return options;
     }
 }
