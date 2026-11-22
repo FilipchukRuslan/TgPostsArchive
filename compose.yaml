@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: posts_archive
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+
+    volumes:
+      - archive-data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "localhost", "-U", "postgres", "-d", "posts_archive"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  web:
+    image: telegram-posts-archive:local
+    build: .
+
+    environment:
+      ConnectionStrings__PostgreSql: "Host=db;Port=5432;Database=posts_archive;Username=postgres;Password=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}"
+
+      ASPNETCORE_HTTP_PORTS: "8080"
+
+      Polling__Interval: ${Polling__Interval:-00:05:00}
+
+    ports:
+      - "127.0.0.1:${ARCHIVE_PORT:-8080}:8080"
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  archive-data:
