@@ -1,7 +1,5 @@
 ﻿using System.Globalization;
-using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
 using System.Text.RegularExpressions;
 using HtmlAgilityPack;
 using TelegramPostsArchive.Models.Parser;
@@ -11,10 +9,6 @@ namespace TelegramPostsArchive.Services;
 public class TelegramHtmlParser
 {
     private readonly ParserOptions _options;
-
-    private static readonly Regex MentionRegex = new(
-        @"(?<![\w])@([A-Za-z0-9_]{5,})",
-        RegexOptions.Compiled);
 
     public TelegramHtmlParser(ParserOptions? options = null)
     {
@@ -41,6 +35,9 @@ public class TelegramHtmlParser
 
         var messages = new List<ParsedMessage>();
         var diagnostics = new List<string>();
+        int? oldestMessageId = null;
+        int? newestMessageId = null;
+        var hasInvalidPostReference = false;
 
         // Find every Telegram message.
         var messageNodes = document.DocumentNode.SelectNodes(
@@ -61,10 +58,14 @@ public class TelegramHtmlParser
                     !string.Equals(parsedPost.Value.Username, channelUsername, StringComparison.OrdinalIgnoreCase))
                 {
                     diagnostics.Add($"Invalid post reference: {post}");
+                    hasInvalidPostReference = true;
                     continue;
                 }
 
                 var (username, messageId) = parsedPost.Value;
+                // A skipped post can still identify the boundary of this page.
+                oldestMessageId = Math.Min(oldestMessageId ?? messageId, messageId);
+                newestMessageId = Math.Max(newestMessageId ?? messageId, messageId);
 
                 // Extract message text.
                 var textNode = node.SelectSingleNode(
@@ -97,25 +98,6 @@ public class TelegramHtmlParser
                 int? views = ParseViews(
                     viewNode?.InnerText);
 
-                // Extract links.
-                var links = new List<string>();
-
-                var anchorNodes = node.SelectNodes(".//a");
-
-                if (anchorNodes != null)
-                {
-                    foreach (var anchor in anchorNodes)
-                    {
-                        string href = anchor.GetAttributeValue(
-                            "href", "");
-
-                        string? normalizedLink = NormalizeLink(href);
-
-                        if (!string.IsNullOrEmpty(normalizedLink))
-                            links.Add(normalizedLink);
-                    }
-                }
-
                 var mediaUrls = new List<string>();
                 foreach (var element in node.Descendants())
                 {
@@ -131,6 +113,16 @@ public class TelegramHtmlParser
                     else if (element.Name == "video" || (element.Name == "source" && element.ParentNode?.Name == "video"))
                     {
                         mediaUrl = element.GetAttributeValue("src", "");
+                    }
+                    else if (classes.Contains("tgme_widget_message_video_player"))
+                    {
+                        var video = element.SelectSingleNode(".//video[@src]");
+
+                        if (video == null || string.IsNullOrWhiteSpace(
+                            video.GetAttributeValue("src", "")))
+                        {
+                            mediaUrl = element.GetAttributeValue("href", "");
+                        }
                     }
 
                     var normalized = NormalizeLink(mediaUrl);
@@ -152,66 +144,43 @@ public class TelegramHtmlParser
                     ? NormalizeText(forwardNode.InnerText)
                     : null;
 
-                // Construct Telegram message URL.
-                string url =
-                    $"https://t.me/{username}/{messageId}";
-
-                // Extract mentions from text and links.
-                string mentionSource =
-                    text + " " + string.Join(" ", links);
-
-                var mentions = ExtractMentions(mentionSource);
-
                 // Build structured message.
                 messages.Add(new ParsedMessage
                 {
                     ChannelUsername = username,
-                    ChannelTitle = channelTitle,
                     TgMsgId = messageId,
-                    Url = url,
                     PostedAt = postedAt,
                     Text = text,
                     Views = views,
-                    Links = links
-                        .Distinct(StringComparer.Ordinal)
-                        .OrderBy(x => x, StringComparer.Ordinal)
-                        .ToList(),
-                    Mentions = mentions,
                     ForwardFrom = forwardFrom,
                     MediaUrls = mediaUrls.Distinct(StringComparer.Ordinal).ToList(),
-                    IsEdited = edited,
-                    ContentHash = ContentHash(
-                        username, messageId, text)
+                    IsEdited = edited
                 });
             }
         }
 
-        // Find oldest message ID for pagination.
-        int? nextBefore = messages.Count > 0
-            ? messages.Min(m => m.TgMsgId)
-            : null;
-
         int? olderBefore = null;
         var olderLinks = document.DocumentNode.SelectNodes(
             "//a[contains(concat(' ', normalize-space(@class), ' '), ' tme_messages_more ') and not(@data-after)]");
-        if (olderLinks != null)
+        var hasValidPagination = olderLinks == null && (!hasInvalidPostReference || oldestMessageId.HasValue);
+        if (olderLinks is { Count: 1 })
         {
-            if (olderLinks.Count != 1)
-                diagnostics.Add("Ambiguous older-page links.");
-            else
+            var href = HtmlEntity.DeEntitize(olderLinks[0].GetAttributeValue("href", ""));
+            if (Uri.TryCreate(new Uri("https://t.me/"), href, out var olderUri) &&
+                olderUri.Host == "t.me" &&
+                string.Equals(olderUri.AbsolutePath, $"/s/{channelUsername}", StringComparison.OrdinalIgnoreCase) &&
+                olderUri.Query.StartsWith("?before=", StringComparison.Ordinal) &&
+                int.TryParse(olderUri.Query["?before=".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out var cursor) &&
+                cursor > 0 &&
+                (cursor == oldestMessageId || hasInvalidPostReference && (oldestMessageId == null || cursor < oldestMessageId)))
             {
-                var href = HtmlEntity.DeEntitize(olderLinks[0].GetAttributeValue("href", ""));
-                if (Uri.TryCreate(new Uri("https://t.me/"), href, out var olderUri) &&
-                    olderUri.Host == "t.me" &&
-                    string.Equals(olderUri.AbsolutePath, $"/s/{channelUsername}", StringComparison.OrdinalIgnoreCase) &&
-                    Regex.IsMatch(olderUri.Query, @"^\?before=[0-9]+$") &&
-                    int.TryParse(olderUri.Query["?before=".Length..], out var cursor) &&
-                    cursor > 0 && cursor == nextBefore)
-                    olderBefore = cursor;
-                else
-                    diagnostics.Add("Invalid older-page cursor.");
+                olderBefore = cursor;
+                hasValidPagination = true;
             }
         }
+
+        if (!hasValidPagination)
+            diagnostics.Add("Could not verify the older-page cursor.");
 
         var historyNode = document.DocumentNode.SelectSingleNode(
             "//*[contains(concat(' ', normalize-space(@class), ' '), ' tgme_channel_history ')]");
@@ -222,9 +191,10 @@ public class TelegramHtmlParser
             ChannelTitle = channelTitle,
             Messages = messages,
             Diagnostics = diagnostics,
-            NextBefore = nextBefore,
+            OldestMessageId = oldestMessageId,
+            NewestMessageId = newestMessageId,
             OlderBefore = olderBefore,
-            HasValidHistory = historyNode != null && !string.IsNullOrWhiteSpace(channelTitle)
+            HasValidHistory = hasValidPagination && historyNode != null && !string.IsNullOrWhiteSpace(channelTitle)
         };
     }
 
@@ -426,37 +396,5 @@ public class TelegramHtmlParser
         }
 
         return uri.AbsoluteUri;
-    }
-
-    // -----------------------------------------
-    // Extract Telegram mentions
-    // -----------------------------------------
-
-    public static List<string> ExtractMentions(string text)
-    {
-        return MentionRegex.Matches(text)
-            .Select(m => "@" + m.Groups[1].Value)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-    }
-
-    // -----------------------------------------
-    // Generate content hash
-    // -----------------------------------------
-
-    public static string ContentHash(
-        string username,
-        int messageId,
-        string text)
-    {
-        string input =
-            $"{username}|{messageId}|{text}";
-
-        byte[] bytes = Encoding.UTF8.GetBytes(input);
-
-        byte[] hash = SHA256.HashData(bytes);
-
-        return Convert.ToHexString(hash).ToLowerInvariant();
     }
 }

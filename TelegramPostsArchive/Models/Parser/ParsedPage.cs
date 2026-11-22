@@ -8,7 +8,8 @@ namespace TelegramPostsArchive.Models.Parser
         public string? ChannelTitle { get; set; }
         public List<ParsedMessage> Messages { get; set; } = new();
         public List<string> Diagnostics { get; set; } = new();
-        public int? NextBefore { get; set; }
+        public int? OldestMessageId { get; set; }
+        public int? NewestMessageId { get; set; }
         public int? OlderBefore { get; set; }
         public bool HasValidHistory { get; set; }
     }

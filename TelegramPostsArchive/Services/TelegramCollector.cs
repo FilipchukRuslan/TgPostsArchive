@@ -11,46 +11,41 @@ namespace TelegramPostsArchive.Services
     TelegramPostStore store,
     ILogger<TelegramCollector> logger)
     {
-        private static readonly DateTime Cutoff = new(2021, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        private static readonly DateTime StopCondition = new(2021, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
-        public async Task<bool> BackfillAsync(
-            string channelTag, int? maxPages = null, CancellationToken cancellationToken = default)
+        public async Task CollectHistoricalPostsAsync(
+            string channelTag, CancellationToken cancellationToken)
         {
-            if (maxPages is <= 0)
-                throw new ArgumentOutOfRangeException(nameof(maxPages));
-
             channelTag = channelTag.ToLowerInvariant();
-            var pages = 0;
-            while (maxPages == null || pages < maxPages)
+            while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var state = await db.TelegramChannels.AsNoTracking()
                     .SingleAsync(channel => channel.ChannelTag == channelTag, cancellationToken);
                 if (state.IsHistoricalCollectionCompleted)
-                    return true;
+                    return;
 
                 var before = state.LastProcessedMessageId;
                 var page = await FetchPageAsync(channelTag, before, cancellationToken);
-                var completed = page.Messages.All(post => post.PostedAt < Cutoff) || page.OlderBefore == null;
-                var nextBefore = page.OlderBefore ?? page.Messages.Min(post => post.TgMsgId);
+                var completed = page.OlderBefore == null || IsBeforeStopCondition(page);
+                var nextBefore = page.OlderBefore ?? page.OldestMessageId;
                 var filteredPage = FilterEligiblePosts(page);
-                await store.SaveBackfillPageAsync(filteredPage, before, nextBefore, completed, cancellationToken);
-                pages++;
+                await store.SaveHistoricalPageAsync(filteredPage, before, nextBefore, completed, cancellationToken);
                 logger.LogInformation("{Channel}: committed {Count} posts, next cursor {Cursor}, completed {Completed}",
                     channelTag, filteredPage.Messages.Count, nextBefore, completed);
                 if (completed)
-                    return true;
+                    return;
             }
-
-            return false;
         }
 
-        public async Task GetNewMessageAsync(string channelTag, CancellationToken cancellationToken = default)
+        public async Task CollectNewPostsAsync(string channelTag, CancellationToken cancellationToken)
         {
             channelTag = channelTag.ToLowerInvariant();
-            var channelWithNewestMsg = await store.UpdateNewestCollectedMessageIdAsync(channelTag, cancellationToken);
-            
-            var newestMsgId = channelWithNewestMsg.NewestCollectedMessageId;
+            var checkpoint = await db.TelegramChannels.AsNoTracking()
+                .SingleAsync(channel => channel.ChannelTag == channelTag, cancellationToken);
+
+            var previousNewestId = checkpoint.NewestCollectedMessageId;
+            var newestMsgId = previousNewestId;
             int? before = null;
             var pages = 0;
 
@@ -64,11 +59,9 @@ namespace TelegramPostsArchive.Services
                         newestMsgId = post.TgMsgId;
                 }
 
-                // Include the full overlap page so already archived posts receive updates.
-                var completed = channelWithNewestMsg.NewestCollectedMessageId == null ||
-                    page.Messages.Any(post => post.TgMsgId <= channelWithNewestMsg.NewestCollectedMessageId.Value) ||
-                    eligiblePage.Messages.Count == 0 || page.OlderBefore == null;
-                await store.SavePollPageAsync(eligiblePage, channelWithNewestMsg, newestMsgId, completed, cancellationToken);
+                var reachedCheckpoint = previousNewestId.HasValue && page.OldestMessageId <= previousNewestId;
+                var completed = reachedCheckpoint || page.OlderBefore == null || IsBeforeStopCondition(page);
+                await store.SaveNewPostsPageAsync(eligiblePage, checkpoint, newestMsgId, completed, cancellationToken);
                 pages++;
                 if (completed)
                 {
@@ -88,20 +81,24 @@ namespace TelegramPostsArchive.Services
             foreach (var diagnostic in page.Diagnostics)
                 logger.LogWarning("{Channel}: {Diagnostic}", channelTag, diagnostic);
 
-            if (!page.HasValidHistory || page.Messages.Count == 0 || page.Diagnostics.Count > 0)
+            if (!page.HasValidHistory)
                 throw new InvalidOperationException($"Uncertain page coverage for {channelTag}. Checkpoint retained.");
 
-            if (before.HasValue && page.Messages.Any(post => post.TgMsgId >= before.Value))
+            if (before.HasValue && (page.NewestMessageId >= before || page.OlderBefore >= before))
                 throw new InvalidOperationException($"Repeated or non-decreasing page for {channelTag}. Checkpoint retained.");
 
             return page;
         }
 
+        private static bool IsBeforeStopCondition(ParsedPage page) =>
+            page.Diagnostics.Count == 0 && page.Messages.Count > 0 &&
+            page.Messages.All(post => post.PostedAt < StopCondition);
+
         private static ParsedPage FilterEligiblePosts(ParsedPage page) => new()
         {
             ChannelUsername = page.ChannelUsername,
             ChannelTitle = page.ChannelTitle,
-            Messages = page.Messages.Where(post => post.PostedAt >= Cutoff).ToList()
+            Messages = page.Messages.Where(post => post.PostedAt >= StopCondition).ToList()
         };
     }
 

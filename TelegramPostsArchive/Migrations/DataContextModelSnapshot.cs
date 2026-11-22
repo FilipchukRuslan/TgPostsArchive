@@ -20,6 +20,7 @@ namespace TelegramPostsArchive.Migrations
                 .HasAnnotation("ProductVersion", "10.0.12")
                 .HasAnnotation("Relational:MaxIdentifierLength", 63);
 
+            NpgsqlModelBuilderExtensions.HasPostgresExtension(modelBuilder, "pg_trgm");
             NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
 
             modelBuilder.Entity("TelegramPostsArchive.Data.Entities.TelegramChannel", b =>
@@ -93,6 +94,11 @@ namespace TelegramPostsArchive.Migrations
                         .HasColumnType("integer");
 
                     b.HasKey("ChannelTag", "MessageId");
+
+                    b.HasIndex("Text");
+
+                    NpgsqlIndexBuilderExtensions.HasMethod(b.HasIndex("Text"), "gin");
+                    NpgsqlIndexBuilderExtensions.HasOperators(b.HasIndex("Text"), new[] { "gin_trgm_ops" });
 
                     b.ToTable("TelegramPosts");
                 });

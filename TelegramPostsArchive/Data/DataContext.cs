@@ -24,7 +24,13 @@ namespace TelegramPostsArchive.Data
             posts.HasKey(post => new { post.ChannelTag, post.MessageId });
             posts.HasOne<TelegramChannel>().WithMany().HasForeignKey(post => post.ChannelTag)
                 .OnDelete(DeleteBehavior.Restrict);
+
+            modelBuilder.HasPostgresExtension("pg_trgm");
+
+            modelBuilder.Entity<TelegramPost>()
+                .HasIndex(post => post.Text)
+                .HasMethod("gin")
+                .HasOperators("gin_trgm_ops");
         }
     }
 }
-

@@ -11,48 +11,47 @@ namespace TelegramPostsArchive.Services.BackgroundWorkers
         protected override async Task ExecuteAsync(
             CancellationToken stoppingToken)
         {
+            await Task.WhenAll(TelegramChannel.SeedTags.Select(
+                channelTag => CollectHistoricalPostsAsync(channelTag, stoppingToken)));
+
+            await Task.WhenAll(TelegramChannel.SeedTags.Select(
+                channelTag => CollectNewPostsAsync(channelTag, stoppingToken)));
+        }
+
+        private async Task CollectHistoricalPostsAsync(string channelTag, CancellationToken stoppingToken)
+        {
+            while (true)
+            {
+                stoppingToken.ThrowIfCancellationRequested();
+                try
+                {
+                    await using var scope = scopeFactory.CreateAsyncScope();
+                    var collector = scope.ServiceProvider.GetRequiredService<TelegramCollector>();
+                    await collector.CollectHistoricalPostsAsync(channelTag, stoppingToken);
+                    return;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested)
+                {
+                    logger.LogError(ex, "{Channel}: historical collection failed.", channelTag);
+                }
+
+                await Task.Delay(options.Value.Interval, stoppingToken);
+            }
+        }
+
+        private async Task CollectNewPostsAsync(string channelTag, CancellationToken stoppingToken)
+        {
             while (!stoppingToken.IsCancellationRequested)
             {
-                foreach (var channelTag in TelegramChannel.SeedTags)
+                try
                 {
-                    stoppingToken.ThrowIfCancellationRequested();
-
-                    // Collect new posts
-                    try
-                    {
-                        await using var scope = scopeFactory.CreateAsyncScope();
-                        var collector = scope.ServiceProvider
-                            .GetRequiredService<TelegramCollector>();
-
-                        await collector.GetNewMessageAsync(channelTag, stoppingToken);
-                    }
-                    catch (Exception ex) when (
-                        ex is not OperationCanceledException ||
-                        !stoppingToken.IsCancellationRequested)
-                    {
-                        logger.LogError(ex,
-                            "{Channel}: polling failed.", channelTag);
-                    }
-
-                    // Continue historical collection
-                    try
-                    {
-                        await using var scope = scopeFactory.CreateAsyncScope();
-                        var collector = scope.ServiceProvider
-                            .GetRequiredService<TelegramCollector>();
-
-                        await collector.BackfillAsync(
-                            channelTag,
-                            null,
-                            stoppingToken);
-                    }
-                    catch (Exception ex) when (
-                        ex is not OperationCanceledException ||
-                        !stoppingToken.IsCancellationRequested)
-                    {
-                        logger.LogError(ex,
-                            "{Channel}: backfill failed.", channelTag);
-                    }
+                    await using var scope = scopeFactory.CreateAsyncScope();
+                    var collector = scope.ServiceProvider.GetRequiredService<TelegramCollector>();
+                    await collector.CollectNewPostsAsync(channelTag, stoppingToken);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested)
+                {
+                    logger.LogError(ex, "{Channel}: new post collection failed.", channelTag);
                 }
 
                 await Task.Delay(options.Value.Interval, stoppingToken);
