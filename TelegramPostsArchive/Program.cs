@@ -28,6 +28,7 @@ builder.Services.AddDbContext<DataContext>(options =>
         builder.Configuration.GetConnectionString("PostgreSql")));
 
 builder.Services.AddSingleton<PostsValidationService>();
+builder.Services.AddScoped<PostsService>();
 
 // Collection services
 builder.Services.AddSingleton<TelegramHtmlParser>();
